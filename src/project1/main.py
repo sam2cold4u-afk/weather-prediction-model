@@ -19,7 +19,7 @@ def step_gradient(b_current, m_current, points, learning_rate):
     
     b_gradient = -(2 / N) * np.sum(error)
     m_gradient = -(2 / N) * np.sum(x * error)
-   0.......esc.00urrent - (learning_rate * b_gradient)
+    new_b = b_current - (learning_rate * b_gradient)
     new_m = m_current - (learning_rate * m_gradient)
     return new_b, new_m
 

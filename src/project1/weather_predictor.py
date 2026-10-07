@@ -1,76 +1,85 @@
+"""Evaluate next-day maximum temperatures using chronological backtesting."""
+import argparse
+from pathlib import Path
+import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-# 1. Load data
-weather = pd.read_csv("project1/local_weather.csv", index_col="DATE")
+DEFAULT_DATA = Path(__file__).resolve().parents[2] / 'local_weather.csv'
 
-# 2. Extract core columns & rename
-core_weather = weather[["PRCP", "SNWD", "TMAX", "TMIN"]].copy()
-core_weather.columns = ["precip", "snow_depth", "temp_max", "temp_min"]
+def load_weather(path):
+    weather = pd.read_csv(path, index_col='DATE', parse_dates=True).sort_index()
+    if not weather.index.is_unique:
+        raise ValueError('Expected one weather record per date.')
+    return weather.asfreq('D')  # Insert absent dates before shifting the target.
 
-# 3. Fill missing values
-core_weather["precip"] = core_weather["precip"].fillna(0)
-core_weather["snow_depth"] = core_weather["snow_depth"].fillna(0)
-core_weather = core_weather.ffill()
+def build_features(weather):
+    features = pd.DataFrame(index=weather.index)
+    features['temp_max'] = weather.TMAX
+    features['temp_min'] = weather.TMIN.ffill(limit=3)
+    features['precip_missing'] = weather.PRCP.isna().astype(int)
+    features['precip'] = weather.PRCP.fillna(0)
+    for column in ['temp_max', 'temp_min']:
+        for horizon in [3, 7, 14]:
+            features[f'{column}_mean_{horizon}'] = features[column].rolling(horizon, min_periods=1).mean()
+        features[f'{column}_change'] = features[column].diff()
+    angle = 2 * np.pi * features.index.dayofyear / 365.25
+    features['season_sin'] = np.sin(angle)
+    features['season_cos'] = np.cos(angle)
+    return features
 
-# 4. Format date index & create target
-core_weather.index = pd.to_datetime(core_weather.index)
-core_weather["target"] = core_weather.shift(-1)["temp_max"]
-core_weather = core_weather.iloc[:-1, :].copy()
+def make_training_data(weather):
+    data = build_features(weather)
+    data['target'] = weather.TMAX.shift(-1)  # Never impute actual target values.
+    return data.dropna()
 
-# 5. Initialize model
-reg = Ridge(alpha=0.1)
+def backtest(data, initial_years=10, step_days=90):
+    if initial_years < 1 or step_days < 1:
+        raise ValueError('Window sizes must be positive.')
+    if data.empty:
+        raise ValueError('No complete observations available.')
+    predictors = data.columns.drop('target')
+    start = data.index.min() + pd.DateOffset(years=initial_years)
+    results = []
+    while start <= data.index.max():
+        train = data.loc[data.index < start]
+        test = data.loc[(data.index >= start) & (data.index < start + pd.Timedelta(days=step_days))]
+        if not test.empty:
+            model = make_pipeline(StandardScaler(), Ridge(alpha=10))
+            model.fit(train[predictors], train.target)
+            result = pd.DataFrame({'actual': test.target,
+                                   'prediction': model.predict(test[predictors]),
+                                   'baseline': test.temp_max}, index=test.index)
+            result['absolute_error'] = (result.prediction - result.actual).abs()
+            results.append(result)
+        start += pd.Timedelta(days=step_days)
+    if not results:
+        raise ValueError('Insufficient history for the initial training window.')
+    return pd.concat(results)
 
-# 6. Define the backtest function
-def backtest(weather, model, predictors, start=3650, step=90):
-    all_predictions = []
-    
-    for i in range(start, weather.shape[0], step):
-        train = weather.iloc[:i, :]
-        test = weather.iloc[i:(i+step), :]
-        
-        model.fit(train[predictors], train["target"])
-        
-        preds = model.predict(test[predictors])
-        preds = pd.Series(preds, index=test.index)
-        combined = pd.concat([test["target"], preds], axis=1)
-        combined.columns = ["actual", "prediction"]
-        combined["diff"] = (combined["prediction"] - combined["actual"]).abs()
-        
-        all_predictions.append(combined)
-        
-    return pd.concat(all_predictions)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data', type=Path, default=DEFAULT_DATA)
+    parser.add_argument('--output', type=Path, help='Optional predictions CSV')
+    args = parser.parse_args()
+    predictions = backtest(make_training_data(load_weather(args.data)))
+    model_error = mean_absolute_error(predictions.actual, predictions.prediction)
+    baseline_error = mean_absolute_error(predictions.actual, predictions.baseline)
+    print(f'Evaluated observations: {len(predictions):,}')
+    print(f'Ridge model MAE: {model_error:.4f}')
+    print(f'Persistence baseline MAE: {baseline_error:.4f}')
+    if baseline_error > 0:
+        print(f'Improvement over baseline: {100 * (1-model_error/baseline_error):.2f}%')
+    print('Errors use the temperature units in the source CSV.')
+    print('\nLargest prediction errors:')
+    print(predictions.nlargest(10, 'absolute_error').to_string())
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        predictions.to_csv(args.output, index_label='forecast_origin_date')
+        print(f'Saved predictions to {args.output}')
 
-# 7. Helper functions for rolling features
-def pct_diff(old, new):
-    return (new - old) / old
-
-def compute_rolling(weather, horizon, col):
-    label = f"rolling_{horizon}_{col}"
-    weather[label] = weather[col].rolling(horizon).mean()
-    weather[f"{label}_pct"] = pct_diff(weather[label], weather[col])
-    return weather
-
-rolling_horizons = [3, 14]
-for horizon in rolling_horizons:
-    for col in ["temp_max", "temp_min", "precip"]:
-        core_weather = compute_rolling(core_weather, horizon, col)
-
-# 8. Expanding averages
-core_weather["month_avg"] = core_weather["temp_max"].groupby(core_weather.index.month, group_keys=False).apply(lambda x: x.expanding(1).mean())
-core_weather["day_of_year_avg"] = core_weather["temp_max"].groupby(core_weather.index.day_of_year, group_keys=False).apply(lambda x: x.expanding(1).mean())
-
-# 9. Clean up NaN / infinite values
-core_weather = core_weather.iloc[14:, :].copy()
-core_weather = core_weather.fillna(0)
-core_weather = core_weather.replace([float("inf"), float("-inf")], 0)
-
-# 10. Run backtest & evaluate
-predictors = core_weather.columns[~core_weather.columns.isin(["target"])]
-predictions = backtest(core_weather, reg, predictors)
-
-error = mean_absolute_error(predictions["actual"], predictions["prediction"])
-print(f"Mean Absolute Error: {error:.2f}")
-print("\nTop 10 Largest Prediction Errors:")
-print(predictions.sort_values("diff", ascending=False).head(10))
+if __name__ == '__main__':
+    main()
